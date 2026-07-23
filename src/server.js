@@ -10,9 +10,11 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 // --- Config (single source of truth; all from env) ---
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
-// The app registers under this Twilio Client identity. Inbound PSTN calls are
-// dialed to this client so Dad answers inside the app.
-const CLIENT_IDENTITY = process.env.CLIENT_IDENTITY || 'dad';
+// Companion-display architecture: an inbound call to our Twilio number is
+// bridged to Dad's real phone (TARGET_PHONE_NUMBER). He answers normally and
+// opens the app to read the live translation.
+const TARGET_PHONE_NUMBER = process.env.TARGET_PHONE_NUMBER || '';
+const CLIENT_IDENTITY = process.env.CLIENT_IDENTITY || 'dad'; // legacy softphone default; unused in display mode
 const TOKEN_TTL_SECONDS = Number(process.env.TOKEN_TTL_SECONDS || 3600);
 
 function requireEnv(name) {
@@ -50,17 +52,18 @@ app.get('/token', async (req) => {
 app.post('/voice', async (req, reply) => {
   const body = req.body || {};
   const from = String(body.From || '');
-  const to = String(body.To || '');
   const twiml = new VoiceResponse();
 
-  if (from.startsWith('client:')) {
-    // App is placing an outbound call.
-    const dial = twiml.dial({ callerId: process.env.TWILIO_PHONE_NUMBER });
-    dial.number(to.replace(/[^\d+]/g, ''));
+  // Inbound call to our Twilio number -> bridge to Dad's real phone.
+  // Phase 2 adds <Start><Stream url="wss://.../media"/> here to fork the call
+  // audio into the Deepgram STT + translation pipeline.
+  if (!TARGET_PHONE_NUMBER) {
+    twiml.say({ voice: 'Polly.Joanna' }, 'This translation line is not set up yet. Goodbye.');
+    twiml.hangup();
   } else {
-    // Inbound call to the Twilio number: ring the app so Dad answers in-app.
-    const dial = twiml.dial();
-    dial.client(CLIENT_IDENTITY);
+    // Show Dad the original caller's number (not ours) so he knows who is calling.
+    const dial = twiml.dial({ callerId: from || process.env.TWILIO_PHONE_NUMBER });
+    dial.number(TARGET_PHONE_NUMBER);
   }
 
   reply.type('text/xml').send(twiml.toString());
