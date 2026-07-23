@@ -1,0 +1,18 @@
+{
+  "name": "call-translator-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Twilio voice + Deepgram translation backend for Call Translator (Loro)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@fastify/formbody": "^8.0.1",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.1.0",
+    "twilio": "^5.3.5"
+  }
+}
