@@ -67,13 +67,13 @@ async function translateToSpanish(text) {
 // ---------------------------------------------------------------------------
 // Deepgram streaming STT (English). Feeds mulaw 8kHz audio, emits finals.
 // ---------------------------------------------------------------------------
-function openDeepgram(onFinalTranscript) {
+function openDeepgram({ model, language }, onFinalTranscript) {
   const params = new URLSearchParams({
     encoding: 'mulaw',
     sample_rate: '8000',
     channels: '1',
-    model: 'nova-2-phonecall',
-    language: 'en',
+    model,
+    language,
     punctuate: 'true',
     smart_format: 'true',
     interim_results: 'false',
@@ -99,15 +99,24 @@ function openDeepgram(onFinalTranscript) {
 app.register(async (f) => {
   f.get('/media', { websocket: true }, (socket) => {
     app.log.info('twilio media stream connected');
-    const queue = [];
-    const dg = openDeepgram(async (englishText) => {
-      const es = await translateToSpanish(englishText);
-      broadcastToApp({ type: 'turn', speaker: 'caller', en: englishText, es });
-      app.log.info({ en: englishText, es }, 'turn');
+    const qIn = [];
+    const qOut = [];
+
+    // Inbound track = the caller (English) -> translate to Spanish for Dad.
+    const dgIn = openDeepgram({ model: 'nova-2-phonecall', language: 'en' }, async (text) => {
+      const es = await translateToSpanish(text);
+      broadcastToApp({ type: 'turn', speaker: 'caller', en: text, es });
+      app.log.info({ side: 'caller', en: text, es }, 'turn');
     });
-    dg.on('open', () => {
-      while (queue.length && dg.readyState === 1) dg.send(queue.shift());
+    // Outbound track = Dad's phone (Spanish) -> shown as-is (his own words).
+    const dgOut = openDeepgram({ model: 'nova-2', language: 'es' }, (text) => {
+      broadcastToApp({ type: 'turn', speaker: 'dad', en: '', es: text });
+      app.log.info({ side: 'dad', es: text }, 'turn');
     });
+
+    const flush = (dg, q) => { while (q.length && dg.readyState === 1) dg.send(q.shift()); };
+    dgIn.on('open', () => flush(dgIn, qIn));
+    dgOut.on('open', () => flush(dgOut, qOut));
 
     socket.on('message', (raw) => {
       let m;
@@ -116,13 +125,19 @@ app.register(async (f) => {
         broadcastToApp({ type: 'call_start' });
       } else if (m.event === 'media') {
         const buf = Buffer.from(m.media.payload, 'base64');
-        if (dg.readyState === 1) dg.send(buf); else queue.push(buf);
+        if (m.media.track === 'outbound') {
+          if (dgOut.readyState === 1) dgOut.send(buf); else qOut.push(buf);
+        } else {
+          if (dgIn.readyState === 1) dgIn.send(buf); else qIn.push(buf);
+        }
       } else if (m.event === 'stop') {
         broadcastToApp({ type: 'call_end' });
-        try { if (dg.readyState === 1) dg.send(JSON.stringify({ type: 'CloseStream' })); dg.close(); } catch { /* */ }
+        for (const dg of [dgIn, dgOut]) {
+          try { if (dg.readyState === 1) dg.send(JSON.stringify({ type: 'CloseStream' })); dg.close(); } catch { /* */ }
+        }
       }
     });
-    socket.on('close', () => { try { dg.close(); } catch { /* */ } });
+    socket.on('close', () => { for (const dg of [dgIn, dgOut]) { try { dg.close(); } catch { /* */ } } });
   });
 
   // App-display clients connect here.
@@ -152,7 +167,7 @@ app.post('/voice', async (req, reply) => {
     // Fork the caller's audio to /media for live translation, then bridge to Dad.
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const start = twiml.start();
-    start.stream({ url: `wss://${host}/media`, track: 'inbound_track' });
+    start.stream({ url: `wss://${host}/media`, track: 'both_tracks' });
     // Use our Twilio number as caller ID. Passing the original caller's number
     // through gets spam-rejected (busy) by many carriers due to STIR/SHAKEN.
     const dial = twiml.dial({ callerId: TWILIO_PHONE_NUMBER || from, answerOnBridge: true });
