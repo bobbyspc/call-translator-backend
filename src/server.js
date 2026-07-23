@@ -17,7 +17,9 @@ const TARGET_PHONE_NUMBER = process.env.TARGET_PHONE_NUMBER || '';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '';
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const TRANSLATE_MODEL = process.env.TRANSLATE_MODEL || 'claude-haiku-4-5-20251001';
+// Best-quality translation model (price is not a constraint here). Sonnet gives
+// near-frontier quality with low latency; override via env if ever needed.
+const TRANSLATE_MODEL = process.env.TRANSLATE_MODEL || 'claude-sonnet-5';
 
 const app = Fastify({ logger: true });
 await app.register(formbody);
