@@ -19,6 +19,8 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 // Fast translation model (Haiku) for lower latency; override via env if needed.
 const TRANSLATE_MODEL = process.env.TRANSLATE_MODEL || 'claude-haiku-4-5-20251001';
+// Summaries are not latency-sensitive; Haiku is plenty and keeps it on one funded account.
+const SUMMARY_MODEL = process.env.SUMMARY_MODEL || 'claude-haiku-4-5-20251001';
 
 const app = Fastify({ logger: true });
 await app.register(formbody);
@@ -39,7 +41,7 @@ function broadcastToApp(obj) {
 // ---------------------------------------------------------------------------
 // Translation: English -> Spanish via Claude (fast Haiku model).
 // ---------------------------------------------------------------------------
-async function translateToSpanish(text) {
+async function callClaude(model, system, userText, maxTokens) {
   if (!ANTHROPIC_API_KEY) return '';
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -50,19 +52,32 @@ async function translateToSpanish(text) {
         'content-type': 'application/json',
       },
       body: JSON.stringify({
-        model: TRANSLATE_MODEL,
-        max_tokens: 300,
-        system:
-          'You are a live phone-call translator. Translate the user\'s English text into natural, conversational Latin American Spanish. Output ONLY the Spanish translation with no quotes, labels, or notes.',
-        messages: [{ role: 'user', content: text }],
+        model,
+        max_tokens: maxTokens,
+        system,
+        messages: [{ role: 'user', content: userText }],
       }),
     });
     const j = await r.json();
     return j?.content?.[0]?.text?.trim() || '';
   } catch (err) {
-    app.log.error({ err }, 'translation failed');
+    app.log.error({ err }, 'claude call failed');
     return '';
   }
+}
+
+const TRANSLATE_SYSTEM =
+  'You are a live phone-call translator. Translate the user\'s English text into natural, conversational Latin American Spanish. Output ONLY the Spanish translation with no quotes, labels, or notes.';
+const translateToSpanish = (text) => callClaude(TRANSLATE_MODEL, TRANSLATE_SYSTEM, text, 300);
+
+const SUMMARY_SYSTEM =
+  'Eres un asistente que resume llamadas telefonicas en espanol para una persona mayor. Te doy la transcripcion (la otra persona y "Usted"). Resume en 2 a 4 frases claras: de que se trato la llamada y cualquier accion, fecha, hora o numero importante que "Usted" deba recordar. Responde solo con el resumen en espanol, sin encabezados.';
+async function summarizeCall(turns) {
+  if (!turns.length) return '';
+  const transcript = turns
+    .map((t) => `${t.speaker === 'caller' ? 'La otra persona' : 'Usted'}: ${t.en}`)
+    .join('\n');
+  return callClaude(SUMMARY_MODEL, SUMMARY_SYSTEM, transcript, 400);
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +117,9 @@ app.register(async (f) => {
     app.log.info('twilio media stream connected');
     // Both sides speak English; everything is translated to Spanish for Dad.
     // Partials stream live to the UI; the finalized phrase gets translated.
+    const transcript = []; // accumulated finalized turns, for the end-of-call summary
+    let summarized = false;
+
     const makeSide = (speaker) => {
       const q = [];
       const dg = openDeepgram({ model: 'nova-2-phonecall', language: 'en' }, async (text, isFinal) => {
@@ -110,6 +128,7 @@ app.register(async (f) => {
           return;
         }
         const es = await translateToSpanish(text);
+        transcript.push({ speaker, en: text, es });
         broadcastToApp({ type: 'turn', speaker, en: text, es });
         app.log.info({ speaker, en: text, es }, 'turn');
       });
@@ -119,6 +138,21 @@ app.register(async (f) => {
 
     const caller = makeSide('caller'); // inbound track
     const dad = makeSide('dad');       // outbound track
+
+    // Generate the summary once, after the call ends, and push it to the app.
+    const finishCall = async () => {
+      if (summarized) return;
+      summarized = true;
+      broadcastToApp({ type: 'call_end' });
+      for (const s of [caller, dad]) {
+        try { if (s.dg.readyState === 1) s.dg.send(JSON.stringify({ type: 'CloseStream' })); s.dg.close(); } catch { /* */ }
+      }
+      // Give any in-flight final translation a moment to land, then summarize.
+      await new Promise((r) => setTimeout(r, 1200));
+      const summary = await summarizeCall(transcript);
+      app.log.info({ turns: transcript.length, summary }, 'summary');
+      broadcastToApp({ type: 'summary', text: summary });
+    };
 
     socket.on('message', (raw) => {
       let m;
@@ -130,13 +164,10 @@ app.register(async (f) => {
         const s = m.media.track === 'outbound' ? dad : caller;
         if (s.dg.readyState === 1) s.dg.send(buf); else s.q.push(buf);
       } else if (m.event === 'stop') {
-        broadcastToApp({ type: 'call_end' });
-        for (const s of [caller, dad]) {
-          try { if (s.dg.readyState === 1) s.dg.send(JSON.stringify({ type: 'CloseStream' })); s.dg.close(); } catch { /* */ }
-        }
+        finishCall();
       }
     });
-    socket.on('close', () => { for (const s of [caller, dad]) { try { s.dg.close(); } catch { /* */ } } });
+    socket.on('close', () => { finishCall(); });
   });
 
   // App-display clients connect here.
