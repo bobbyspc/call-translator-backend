@@ -69,7 +69,7 @@ async function translateToSpanish(text) {
 // ---------------------------------------------------------------------------
 // Deepgram streaming STT (English). Feeds mulaw 8kHz audio, emits finals.
 // ---------------------------------------------------------------------------
-function openDeepgram({ model, language }, onFinalTranscript) {
+function openDeepgram({ model, language }, onTranscript) {
   const params = new URLSearchParams({
     encoding: 'mulaw',
     sample_rate: '8000',
@@ -78,8 +78,8 @@ function openDeepgram({ model, language }, onFinalTranscript) {
     language,
     punctuate: 'true',
     smart_format: 'true',
-    interim_results: 'false',
-    endpointing: '300',
+    interim_results: 'true', // stream partials so the UI shows words live
+    endpointing: '250',
   });
   const dg = new WebSocket('wss://api.deepgram.com/v1/listen?' + params.toString(), {
     headers: { Authorization: 'Token ' + DEEPGRAM_API_KEY },
@@ -88,7 +88,7 @@ function openDeepgram({ model, language }, onFinalTranscript) {
     try {
       const msg = JSON.parse(data.toString());
       const text = msg?.channel?.alternatives?.[0]?.transcript?.trim();
-      if (text && msg.is_final) onFinalTranscript(text);
+      if (text) onTranscript(text, !!msg.is_final);
     } catch { /* ignore keepalives */ }
   });
   dg.on('error', (err) => app.log.error({ err }, 'deepgram ws error'));
@@ -101,24 +101,25 @@ function openDeepgram({ model, language }, onFinalTranscript) {
 app.register(async (f) => {
   f.get('/media', { websocket: true }, (socket) => {
     app.log.info('twilio media stream connected');
-    const qIn = [];
-    const qOut = [];
+    // Both sides speak English; everything is translated to Spanish for Dad.
+    // Partials stream live to the UI; the finalized phrase gets translated.
+    const makeSide = (speaker) => {
+      const q = [];
+      const dg = openDeepgram({ model: 'nova-2-phonecall', language: 'en' }, async (text, isFinal) => {
+        if (!isFinal) {
+          broadcastToApp({ type: 'interim', speaker, en: text });
+          return;
+        }
+        const es = await translateToSpanish(text);
+        broadcastToApp({ type: 'turn', speaker, en: text, es });
+        app.log.info({ speaker, en: text, es }, 'turn');
+      });
+      dg.on('open', () => { while (q.length && dg.readyState === 1) dg.send(q.shift()); });
+      return { dg, q };
+    };
 
-    // Inbound track = the caller (English) -> translate to Spanish for Dad.
-    const dgIn = openDeepgram({ model: 'nova-2-phonecall', language: 'en' }, async (text) => {
-      const es = await translateToSpanish(text);
-      broadcastToApp({ type: 'turn', speaker: 'caller', en: text, es });
-      app.log.info({ side: 'caller', en: text, es }, 'turn');
-    });
-    // Outbound track = Dad's phone (Spanish) -> shown as-is (his own words).
-    const dgOut = openDeepgram({ model: 'nova-2', language: 'es' }, (text) => {
-      broadcastToApp({ type: 'turn', speaker: 'dad', en: '', es: text });
-      app.log.info({ side: 'dad', es: text }, 'turn');
-    });
-
-    const flush = (dg, q) => { while (q.length && dg.readyState === 1) dg.send(q.shift()); };
-    dgIn.on('open', () => flush(dgIn, qIn));
-    dgOut.on('open', () => flush(dgOut, qOut));
+    const caller = makeSide('caller'); // inbound track
+    const dad = makeSide('dad');       // outbound track
 
     socket.on('message', (raw) => {
       let m;
@@ -127,19 +128,16 @@ app.register(async (f) => {
         broadcastToApp({ type: 'call_start' });
       } else if (m.event === 'media') {
         const buf = Buffer.from(m.media.payload, 'base64');
-        if (m.media.track === 'outbound') {
-          if (dgOut.readyState === 1) dgOut.send(buf); else qOut.push(buf);
-        } else {
-          if (dgIn.readyState === 1) dgIn.send(buf); else qIn.push(buf);
-        }
+        const s = m.media.track === 'outbound' ? dad : caller;
+        if (s.dg.readyState === 1) s.dg.send(buf); else s.q.push(buf);
       } else if (m.event === 'stop') {
         broadcastToApp({ type: 'call_end' });
-        for (const dg of [dgIn, dgOut]) {
-          try { if (dg.readyState === 1) dg.send(JSON.stringify({ type: 'CloseStream' })); dg.close(); } catch { /* */ }
+        for (const s of [caller, dad]) {
+          try { if (s.dg.readyState === 1) s.dg.send(JSON.stringify({ type: 'CloseStream' })); s.dg.close(); } catch { /* */ }
         }
       }
     });
-    socket.on('close', () => { for (const dg of [dgIn, dgOut]) { try { dg.close(); } catch { /* */ } } });
+    socket.on('close', () => { for (const s of [caller, dad]) { try { s.dg.close(); } catch { /* */ } } });
   });
 
   // App-display clients connect here.
