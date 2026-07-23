@@ -153,8 +153,9 @@ app.post('/voice', async (req, reply) => {
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const start = twiml.start();
     start.stream({ url: `wss://${host}/media`, track: 'inbound_track' });
-    // Show Dad the original caller's number (not ours) so he knows who is calling.
-    const dial = twiml.dial({ callerId: from || TWILIO_PHONE_NUMBER });
+    // Use our Twilio number as caller ID. Passing the original caller's number
+    // through gets spam-rejected (busy) by many carriers due to STIR/SHAKEN.
+    const dial = twiml.dial({ callerId: TWILIO_PHONE_NUMBER || from, answerOnBridge: true });
     dial.number(TARGET_PHONE_NUMBER);
   }
 
