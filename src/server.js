@@ -13,7 +13,15 @@ const HOST = process.env.HOST || '0.0.0.0';
 // Companion-display architecture: an inbound call to our Twilio number is
 // bridged to Dad's real phone (TARGET_PHONE_NUMBER). He answers normally and
 // opens the app to read the live translation.
+// Answering endpoints. An inbound call rings every configured endpoint at once
+// (Twilio "simulring"); the first to answer wins and the rest are cancelled.
+// TARGET_PHONE_NUMBER is Dad's second phone line and is the reliable floor:
+// it works with the app closed, uninstalled, or the phone in deep sleep.
+// The app client leg is an additional, optional way to pick up.
 const TARGET_PHONE_NUMBER = process.env.TARGET_PHONE_NUMBER || '';
+const APP_CLIENT_IDENTITY = process.env.CLIENT_IDENTITY || '';
+const ENABLE_APP_ANSWER = process.env.ENABLE_APP_ANSWER === 'true';
+const RING_TIMEOUT_SECONDS = Number(process.env.RING_TIMEOUT_SECONDS || 25);
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '';
 // Numbers whose carrier forwards calls INTO this line. Dialing one of them back
 // would be forwarded straight back to us: an infinite, billable call loop.
@@ -207,39 +215,95 @@ app.post('/voice', async (req, reply) => {
   const from = String(body.From || '');
   const twiml = new VoiceResponse();
 
-  // --- Loop guards. A forwarding loop fans out exponentially and bills for
-  // every leg, so refuse the call rather than risk it.
-  const isSelfCall = sameNumber(from, TWILIO_PHONE_NUMBER);
-  const targetForwardsToUs = FORWARDING_SOURCE_NUMBERS.some((n) => sameNumber(n, TARGET_PHONE_NUMBER));
-
-  if (!TARGET_PHONE_NUMBER) {
-    twiml.say({ voice: 'Polly.Joanna' }, 'This translation line is not set up yet. Goodbye.');
-    twiml.hangup();
-  } else if (isSelfCall) {
+  // --- Loop guard: a call that appears to come from our own number means we
+  // are talking to ourselves. A forwarding loop fans out exponentially and
+  // bills for every leg, so drop it immediately.
+  if (sameNumber(from, TWILIO_PHONE_NUMBER)) {
     app.log.error({ from }, 'LOOP GUARD: inbound call is from our own number, refusing');
     twiml.hangup();
-  } else if (targetForwardsToUs) {
-    app.log.error(
-      { target: TARGET_PHONE_NUMBER, forwardingSources: FORWARDING_SOURCE_NUMBERS },
-      'LOOP GUARD: TARGET_PHONE_NUMBER forwards back into this line, refusing to dial',
-    );
-    twiml.say({ voice: 'Polly.Joanna' }, 'This line is misconfigured. Goodbye.');
-    twiml.hangup();
-  } else {
-    // Fork the caller's audio to /media for live translation, then bridge to Dad.
-    const host = req.headers['x-forwarded-host'] || req.headers.host;
-    const start = twiml.start();
-    const stream = start.stream({ url: `wss://${host}/media`, track: 'both_tracks' });
-    // Carry the real caller's number into the media stream so the app can show
-    // who is calling (the handset only ever sees our Twilio number, below).
-    stream.parameter({ name: 'from', value: from });
-    // Use our Twilio number as caller ID. Passing the original caller's number
-    // through gets spam-rejected (busy) by many carriers due to STIR/SHAKEN.
-    const dial = twiml.dial({ callerId: TWILIO_PHONE_NUMBER || from, answerOnBridge: true });
-    dial.number(TARGET_PHONE_NUMBER);
+    return reply.type('text/xml').send(twiml.toString());
   }
 
+  // --- Assemble the answering endpoints.
+  const legs = [];
+  if (TARGET_PHONE_NUMBER) {
+    // Second loop guard: never dial a number whose carrier forwards back into
+    // this line. Drop just this leg rather than the whole call, so a bad
+    // TARGET_PHONE_NUMBER cannot silently kill Dad's phone service.
+    if (FORWARDING_SOURCE_NUMBERS.some((n) => sameNumber(n, TARGET_PHONE_NUMBER))) {
+      app.log.error(
+        { target: TARGET_PHONE_NUMBER, forwardingSources: FORWARDING_SOURCE_NUMBERS },
+        'LOOP GUARD: TARGET_PHONE_NUMBER forwards back into this line, dropping that leg',
+      );
+    } else {
+      legs.push({ kind: 'number', value: TARGET_PHONE_NUMBER });
+    }
+  }
+  // If the app is not registered, Twilio fails this leg immediately and the
+  // phone leg keeps ringing. That degradation is the point of ringing both.
+  if (ENABLE_APP_ANSWER && APP_CLIENT_IDENTITY) {
+    legs.push({ kind: 'client', value: APP_CLIENT_IDENTITY });
+  }
+
+  if (!legs.length) {
+    app.log.error('no answering endpoints configured, refusing call');
+    twiml.say({ voice: 'Polly.Joanna' }, 'This line is not available right now. Goodbye.');
+    twiml.hangup();
+    return reply.type('text/xml').send(twiml.toString());
+  }
+
+  // Fork the call audio to /media for live translation, then ring every endpoint.
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  const start = twiml.start();
+  const stream = start.stream({ url: `wss://${host}/media`, track: 'both_tracks' });
+  // Carry the real caller's number into the media stream so the app can show
+  // who is calling (the handset only ever sees our Twilio number, below).
+  stream.parameter({ name: 'from', value: from });
+  // Use our Twilio number as caller ID. Passing the original caller's number
+  // through gets spam-rejected (busy) by many carriers due to STIR/SHAKEN.
+  const dial = twiml.dial({
+    callerId: TWILIO_PHONE_NUMBER || from,
+    answerOnBridge: true,
+    timeout: RING_TIMEOUT_SECONDS,
+  });
+  for (const leg of legs) {
+    if (leg.kind === 'number') dial.number(leg.value);
+    else dial.client(leg.value);
+  }
+  app.log.info({ legs: legs.map((l) => `${l.kind}:${l.value}`) }, 'ringing');
+
   reply.type('text/xml').send(twiml.toString());
+});
+
+// Mints the access token the app needs to register as a Twilio Voice client
+// and receive the <Client> leg above. Only needed when ENABLE_APP_ANSWER is on.
+app.get('/token', async (req, reply) => {
+  const { TWILIO_ACCOUNT_SID, TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, TWILIO_TWIML_APP_SID } = process.env;
+  // Push credential ties incoming calls to FCM so the app can ring while
+  // backgrounded. Without it the app only receives calls while in foreground.
+  const TWILIO_PUSH_CREDENTIAL_SID = process.env.TWILIO_PUSH_CREDENTIAL_SID || '';
+
+  if (!ENABLE_APP_ANSWER) return reply.code(404).send({ error: 'app answering is disabled' });
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY_SID || !TWILIO_API_KEY_SECRET || !TWILIO_TWIML_APP_SID) {
+    return reply.code(500).send({ error: 'twilio credentials not configured' });
+  }
+  if (!APP_CLIENT_IDENTITY) return reply.code(500).send({ error: 'CLIENT_IDENTITY not set' });
+
+  const { AccessToken } = twilio.jwt;
+  const grant = new AccessToken.VoiceGrant({
+    outgoingApplicationSid: TWILIO_TWIML_APP_SID,
+    incomingAllow: true,
+    ...(TWILIO_PUSH_CREDENTIAL_SID ? { pushCredentialSid: TWILIO_PUSH_CREDENTIAL_SID } : {}),
+  });
+  const token = new AccessToken(TWILIO_ACCOUNT_SID, TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, {
+    identity: APP_CLIENT_IDENTITY,
+  });
+  token.addGrant(grant);
+  return {
+    token: token.toJwt(),
+    identity: APP_CLIENT_IDENTITY,
+    hasPushCredential: !!TWILIO_PUSH_CREDENTIAL_SID,
+  };
 });
 
 // Keep the free-tier instance awake so the first call after a quiet stretch
