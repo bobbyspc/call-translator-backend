@@ -15,6 +15,17 @@ const HOST = process.env.HOST || '0.0.0.0';
 // opens the app to read the live translation.
 const TARGET_PHONE_NUMBER = process.env.TARGET_PHONE_NUMBER || '';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '';
+// Numbers whose carrier forwards calls INTO this line. Dialing one of them back
+// would be forwarded straight back to us: an infinite, billable call loop.
+// Comma-separated E.164 list.
+const FORWARDING_SOURCE_NUMBERS = (process.env.FORWARDING_SOURCE_NUMBERS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+// Render's free tier sleeps after ~15 min idle and takes ~50s to wake, long
+// enough for Twilio to time out and drop an inbound call. Self-ping to stay up.
+const KEEP_WARM_URL = process.env.KEEP_WARM_URL || '';
+const KEEP_WARM_MINUTES = Number(process.env.KEEP_WARM_MINUTES || 10);
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 // Fast translation model (Haiku) for lower latency; override via env if needed.
@@ -158,7 +169,9 @@ app.register(async (f) => {
       let m;
       try { m = JSON.parse(raw.toString()); } catch { return; }
       if (m.event === 'start') {
-        broadcastToApp({ type: 'call_start' });
+        // `from` is passed through from /voice as a <Parameter> on the stream.
+        const from = m.start?.customParameters?.from || '';
+        broadcastToApp({ type: 'call_start', from });
       } else if (m.event === 'media') {
         const buf = Buffer.from(m.media.payload, 'base64');
         const s = m.media.track === 'outbound' ? dad : caller;
@@ -184,20 +197,42 @@ app.register(async (f) => {
 // ---------------------------------------------------------------------------
 app.get('/health', async () => ({ ok: true, service: 'call-translator-backend', appClients: appClients.size }));
 
+// Compare phone numbers by digits only, so +1 786... and 1786... match.
+const digits = (n) => String(n || '').replace(/\D/g, '');
+const sameNumber = (a, b) => !!digits(a) && digits(a) === digits(b);
+
 // Twilio hits this when a call comes in to our number.
 app.post('/voice', async (req, reply) => {
   const body = req.body || {};
   const from = String(body.From || '');
   const twiml = new VoiceResponse();
 
+  // --- Loop guards. A forwarding loop fans out exponentially and bills for
+  // every leg, so refuse the call rather than risk it.
+  const isSelfCall = sameNumber(from, TWILIO_PHONE_NUMBER);
+  const targetForwardsToUs = FORWARDING_SOURCE_NUMBERS.some((n) => sameNumber(n, TARGET_PHONE_NUMBER));
+
   if (!TARGET_PHONE_NUMBER) {
     twiml.say({ voice: 'Polly.Joanna' }, 'This translation line is not set up yet. Goodbye.');
+    twiml.hangup();
+  } else if (isSelfCall) {
+    app.log.error({ from }, 'LOOP GUARD: inbound call is from our own number, refusing');
+    twiml.hangup();
+  } else if (targetForwardsToUs) {
+    app.log.error(
+      { target: TARGET_PHONE_NUMBER, forwardingSources: FORWARDING_SOURCE_NUMBERS },
+      'LOOP GUARD: TARGET_PHONE_NUMBER forwards back into this line, refusing to dial',
+    );
+    twiml.say({ voice: 'Polly.Joanna' }, 'This line is misconfigured. Goodbye.');
     twiml.hangup();
   } else {
     // Fork the caller's audio to /media for live translation, then bridge to Dad.
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const start = twiml.start();
-    start.stream({ url: `wss://${host}/media`, track: 'both_tracks' });
+    const stream = start.stream({ url: `wss://${host}/media`, track: 'both_tracks' });
+    // Carry the real caller's number into the media stream so the app can show
+    // who is calling (the handset only ever sees our Twilio number, below).
+    stream.parameter({ name: 'from', value: from });
     // Use our Twilio number as caller ID. Passing the original caller's number
     // through gets spam-rejected (busy) by many carriers due to STIR/SHAKEN.
     const dial = twiml.dial({ callerId: TWILIO_PHONE_NUMBER || from, answerOnBridge: true });
@@ -206,6 +241,16 @@ app.post('/voice', async (req, reply) => {
 
   reply.type('text/xml').send(twiml.toString());
 });
+
+// Keep the free-tier instance awake so the first call after a quiet stretch
+// does not hit a ~50s cold start and get dropped by Twilio.
+if (KEEP_WARM_URL) {
+  const timer = setInterval(() => {
+    fetch(KEEP_WARM_URL).catch((err) => app.log.warn({ err }, 'keep-warm ping failed'));
+  }, KEEP_WARM_MINUTES * 60 * 1000);
+  timer.unref?.();
+  app.log.info({ url: KEEP_WARM_URL, minutes: KEEP_WARM_MINUTES }, 'keep-warm enabled');
+}
 
 try {
   await app.listen({ port: PORT, host: HOST });
