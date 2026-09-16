@@ -43,6 +43,7 @@ phone number's VoiceFallbackUrl.
   --target <E.164>  Number to bridge to when the main backend is down (required
                     unless --show). Should match TARGET_PHONE_NUMBER on Render.
   --show            Print the current fallback config and exit.
+  --check           Validate local routing inputs without contacting Twilio.
   --json            Machine-readable output.
   --help            This message.`);
   process.exit(0);
@@ -104,6 +105,15 @@ if (target.replace(/\D/g, '') === TWILIO_PHONE_NUMBER.replace(/\D/g, '')) {
   console.error('--target cannot be the Twilio number itself (that is a call loop).');
   process.exit(1);
 }
+const forwardingSources = String(process.env.FORWARDING_SOURCE_NUMBERS || '').split(',').map((value) => value.replace(/\D/g, '')).filter(Boolean);
+if (forwardingSources.includes(target.replace(/\D/g, ''))) {
+  console.error('--target is listed in FORWARDING_SOURCE_NUMBERS and would create a forwarding loop.');
+  process.exit(1);
+}
+if (has('--check')) {
+  console.log(json ? JSON.stringify({ ok: true, target, loopGuard: 'passed' }) : 'Configuration check passed. No network request was made.');
+  process.exit(0);
+}
 
 // The deployed function. Kept deliberately dumb: no dependencies, no network
 // calls, just bridge the call. TARGET/CALLER_ID come from service env vars so
@@ -111,7 +121,9 @@ if (target.replace(/\D/g, '') === TWILIO_PHONE_NUMBER.replace(/\D/g, '')) {
 const FUNCTION_SOURCE = `exports.handler = function (context, event, callback) {
   const twiml = new Twilio.twiml.VoiceResponse();
   const target = context.FAILOVER_TARGET;
-  if (!target) {
+  const digits = value => String(value || '').replace(/\\D/g, '');
+  const sources = String(context.FORWARDING_SOURCE_NUMBERS || '').split(',').map(digits).filter(Boolean);
+  if (!target || digits(target) === digits(context.FAILOVER_CALLER_ID) || sources.includes(digits(target))) {
     twiml.say({ voice: 'Polly.Joanna' }, 'This line is not available right now. Goodbye.');
     twiml.hangup();
   } else {
@@ -169,7 +181,7 @@ if (!env) {
   });
   log('created environment', env.sid, env.domain_name);
 }
-const wanted = { FAILOVER_TARGET: target, FAILOVER_CALLER_ID: TWILIO_PHONE_NUMBER };
+const wanted = { FAILOVER_TARGET: target, FAILOVER_CALLER_ID: TWILIO_PHONE_NUMBER, FORWARDING_SOURCE_NUMBERS: process.env.FORWARDING_SOURCE_NUMBERS || '' };
 const currentVars = (await call(`${API}/Services/${svc}/Environments/${env.sid}/Variables?PageSize=50`)).variables || [];
 for (const [key, value] of Object.entries(wanted)) {
   const found = currentVars.find((v) => v.key === key);

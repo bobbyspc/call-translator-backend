@@ -7,13 +7,17 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "demo": "node scripts/local-demo.mjs"
   },
   "dependencies": {
+    "@fastify/cors": "^11.3.0",
     "@fastify/formbody": "^8.0.1",
     "@fastify/websocket": "^11.0.1",
     "dotenv": "^16.4.5",
     "fastify": "^5.1.0",
+    "firebase-admin": "^13.10.0",
     "twilio": "^5.3.5",
     "ws": "^8.18.0"
   }

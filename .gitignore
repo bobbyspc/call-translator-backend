@@ -3,3 +3,5 @@ node_modules/
 *.log
 health.json
 token.json
+data/
+*.state.json
